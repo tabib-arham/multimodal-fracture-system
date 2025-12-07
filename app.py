@@ -20,7 +20,24 @@ try:
     from tensorflow import keras
     from tensorflow.keras.models import Model, load_model
 except Exception:
-    TF_IMPORT_ERROR = traceback.format_exc()
+    # Capture full traceback and append environment details to help debugging
+    tb = traceback.format_exc()
+    env_info_lines = []
+    try:
+        env_info_lines.append(f"Python: {sys.version.replace(chr(10), ' ')}")
+    except Exception:
+        env_info_lines.append("Python: unavailable")
+    try:
+        env_info_lines.append(f"Platform: {platform.platform()}")
+    except Exception:
+        env_info_lines.append("Platform: unavailable")
+    try:
+        import numpy as _np
+        env_info_lines.append(f"NumPy: {_np.__version__} ({getattr(_np, '__file__', 'location unknown')})")
+    except Exception as e:
+        env_info_lines.append(f"NumPy: failed to import ({str(e)})")
+
+    TF_IMPORT_ERROR = tb + "\n\nEnvironment info:\n" + "\n".join(env_info_lines)
     tf = None
     keras = None
     Model = None
@@ -491,12 +508,51 @@ def main():
             uploaded_file = st.file_uploader("Upload X-ray image", type=['jpg', 'jpeg', 'png'])
             
             if uploaded_file:
-                # Read image
-                file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                
-                st.image(image_rgb, caption="Uploaded X-ray", use_container_width=True)
+                # Read and robustly validate image bytes
+                try:
+                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+
+                    if image is None:
+                        st.error("Failed to decode uploaded image. The file may be corrupted or an unsupported format.")
+                        st.stop()
+
+                    # Handle grayscale, BGR, and BGRA images
+                    if image.ndim == 2:
+                        image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+                    elif image.ndim == 3 and image.shape[2] == 4:
+                        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+                    elif image.ndim == 3 and image.shape[2] == 3:
+                        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    else:
+                        st.error(f"Unsupported image shape: {getattr(image, 'shape', None)}")
+                        st.stop()
+
+                    # Ensure uint8 dtype for Streamlit display
+                    if image_rgb.dtype != np.uint8:
+                        try:
+                            if image_rgb.max() <= 1.0:
+                                image_rgb = (image_rgb * 255).astype(np.uint8)
+                            else:
+                                image_rgb = image_rgb.astype(np.uint8)
+                        except Exception:
+                            image_rgb = image_rgb.astype(np.uint8, copy=False)
+
+                    # Display image with diagnostics on failure
+                    try:
+                        st.image(image_rgb, caption="Uploaded X-ray", use_container_width=True)
+                    except Exception as e:
+                        st.error("Failed to display uploaded image. See diagnostics below.")
+                        st.markdown(f"- Type: `{type(image_rgb)}`")
+                        st.markdown(f"- Shape: `{getattr(image_rgb, 'shape', None)}`")
+                        st.markdown(f"- Dtype: `{getattr(image_rgb, 'dtype', None)}`")
+                        st.error(str(e))
+                        st.code(traceback.format_exc())
+                        st.stop()
+                except Exception as e:
+                    st.error(f"Unexpected error while processing uploaded file: {e}")
+                    st.code(traceback.format_exc())
+                    st.stop()
         
         with col2:
             st.subheader("📋 Patient Metadata")
