@@ -1,5 +1,5 @@
 streamlit
-numpy=1.23.5
+numpy==1.23.5
 pandas
 tensorflow-cpu==2.10.0
 opencv-python-headless
@@ -12,5 +12,6 @@ seaborn
 albumentations
 tqdm
 gdown
+
 
 
