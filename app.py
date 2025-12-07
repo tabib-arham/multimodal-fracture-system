@@ -6,9 +6,25 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import pickle
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.models import Model, load_model
+import os
+import gdown
+import tempfile
+import traceback
+import sys
+import platform
+
+# Capture TensorFlow import errors so the app can display helpful troubleshooting info
+TF_IMPORT_ERROR = None
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras.models import Model, load_model
+except Exception:
+    TF_IMPORT_ERROR = traceback.format_exc()
+    tf = None
+    keras = None
+    Model = None
+    load_model = None
 from lime import lime_image
 from skimage.segmentation import mark_boundaries
 import warnings
@@ -71,6 +87,11 @@ BASE_DIR = Path(r"c:\Users\noora\Downloads\Telegram Desktop\thesis data\thesis d
 MODELS_DIR = BASE_DIR / "outputs" / "models"
 OUTPUT_DIR = BASE_DIR / "outputs"
 
+# Default Model URL (Configure your model URL here)
+# Set to None if you don't want a default model
+DEFAULT_MODEL_URL = "https://drive.google.com/file/d/1731iJjX5LsxeaoM37sUP2lKIxhcsnUEz/view?usp=drive_link"
+# Or use a direct URL: "https://example.com/path/to/model.h5"
+
 # Initialize session state
 if 'model' not in st.session_state:
     st.session_state.model = None
@@ -80,6 +101,8 @@ if 'scaler' not in st.session_state:
     st.session_state.scaler = None
 if 'metadata_feature_cols' not in st.session_state:
     st.session_state.metadata_feature_cols = None
+if 'gdrive_model_path' not in st.session_state:
+    st.session_state.gdrive_model_path = None
 
 # Helper Functions
 @st.cache_resource
@@ -98,11 +121,72 @@ def load_preprocessing_objects():
 @st.cache_resource
 def load_trained_model(model_path):
     """Load a trained model"""
+    if tf is None:
+        st.error("TensorFlow is not available in this environment. See troubleshooting information at the top of the app.")
+        return None
+
     try:
-        model = load_model(model_path)
+        # Handle custom objects for TensorFlow 2.10
+        model = load_model(model_path, compile=False)
+        # Recompile with appropriate settings
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
         return model
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
+        return None
+
+@st.cache_resource
+def download_model_from_url(url):
+    """Download model from URL (Google Drive or direct link)"""
+    try:
+        import urllib.request
+        
+        # Create temporary directory
+        temp_dir = tempfile.mkdtemp()
+        output_path = os.path.join(temp_dir, 'model.h5')
+        
+        # Check if it's a Google Drive URL
+        if 'drive.google.com' in url:
+            # Extract file ID from Google Drive URL
+            if '/file/d/' in url:
+                file_id = url.split('/file/d/')[1].split('/')[0]
+            elif 'id=' in url:
+                file_id = url.split('id=')[1].split('&')[0]
+            else:
+                st.error("Invalid Google Drive URL format")
+                return None
+            
+            # Create download URL for gdown
+            download_url = f'https://drive.google.com/uc?id={file_id}'
+            
+            # Download using gdown
+            with st.spinner('Downloading model from Google Drive...'):
+                gdown.download(download_url, output_path, quiet=False)
+        
+        else:
+            # Direct URL download
+            with st.spinner('Downloading model from URL...'):
+                # Download with progress
+                def reporthook(count, block_size, total_size):
+                    if total_size > 0:
+                        percent = int(count * block_size * 100 / total_size)
+                        st.write(f"Download progress: {percent}%")
+                
+                urllib.request.urlretrieve(url, output_path, reporthook)
+        
+        # Verify file exists and has content
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return output_path
+        else:
+            st.error("Downloaded file is empty or doesn't exist")
+            return None
+            
+    except Exception as e:
+        st.error(f"Error downloading model: {str(e)}")
         return None
 
 def preprocess_xray_image(image, apply_clahe=True, apply_blur=True):
@@ -151,6 +235,10 @@ def prepare_image_for_model(image):
 
 def generate_gradcam(model, img_array, meta_array, class_idx, layer_name=None):
     """Generate Grad-CAM heatmap"""
+    if tf is None:
+        st.error("Grad-CAM requires TensorFlow, which failed to import in this environment.")
+        return None
+
     try:
         # Find last conv layer if not specified
         if layer_name is None:
@@ -273,30 +361,108 @@ def main():
     st.markdown('<h1 class="main-header">🦴 Bone Fracture Classification System</h1>', unsafe_allow_html=True)
     st.markdown('<p class="sub-header">AI-Powered Multimodal Fracture Detection with Interpretability</p>', unsafe_allow_html=True)
     
+    # If TensorFlow failed to import, show traceback and troubleshooting tips
+    if TF_IMPORT_ERROR:
+        st.error("TensorFlow failed to import — model loading and interpretability require TensorFlow.")
+        with st.expander("Show TensorFlow import traceback"):
+            st.code(TF_IMPORT_ERROR)
+
+        st.markdown("**Suggested fixes:**")
+        st.markdown("- Ensure your Python version and TensorFlow wheel are compatible (many Linux hosts work with Python 3.8–3.10).")
+        st.markdown("- Try installing a CPU-only build: `pip install tensorflow-cpu` or pin a specific version: `pip install tensorflow==2.10.0`.")
+        st.markdown("- On hosted platforms (Streamlit Cloud) pin the working TensorFlow build in `requirements.txt`.")
+        st.warning("If TensorFlow is unavailable, the app cannot run model predictions, Grad-CAM, or other TF-dependent features.")
+    
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Configuration")
         
         # Model selection
-        st.subheader("1. Select Model")
-        model_files = list(MODELS_DIR.glob("*.h5"))
+        st.subheader("1. Select Model Source")
         
-        if model_files:
-            model_names = [f.stem for f in model_files]
-            selected_model = st.selectbox("Choose a trained model:", model_names)
+        # Determine available options
+        options = ["Local Files", "URL (Google Drive or Direct)"]
+        if DEFAULT_MODEL_URL:
+            options.insert(0, "Default Model (Hardcoded)")
+        
+        model_source = st.radio("Load model from:", options)
+        
+        if model_source == "Default Model (Hardcoded)":
+            st.info(f"📌 Using configured default model")
+            st.code(DEFAULT_MODEL_URL, language=None)
             
-            if st.button("Load Model"):
-                with st.spinner("Loading model..."):
-                    model_path = MODELS_DIR / f"{selected_model}.h5"
-                    st.session_state.model = load_trained_model(model_path)
-                    st.session_state.label_encoders, st.session_state.scaler = load_preprocessing_objects()
+            if st.button("Load Default Model"):
+                # Download from default URL
+                model_path = download_model_from_url(DEFAULT_MODEL_URL)
+                
+                if model_path:
+                    st.session_state.gdrive_model_path = model_path
                     
-                    if st.session_state.model:
-                        st.success(f"✅ Model '{selected_model}' loaded successfully!")
+                    # Load model
+                    with st.spinner("Loading default model..."):
+                        st.session_state.model = load_trained_model(model_path)
+                        st.session_state.label_encoders, st.session_state.scaler = load_preprocessing_objects()
+                        
+                        if st.session_state.model:
+                            st.success("✅ Default model loaded successfully!")
+                        else:
+                            st.error("❌ Failed to load model")
+                else:
+                    st.error("❌ Failed to download default model")
+        
+        elif model_source == "Local Files":
+            model_files = list(MODELS_DIR.glob("*.h5"))
+            
+            if model_files:
+                model_names = [f.stem for f in model_files]
+                selected_model = st.selectbox("Choose a trained model:", model_names)
+                
+                if st.button("Load Model"):
+                    with st.spinner("Loading model..."):
+                        model_path = MODELS_DIR / f"{selected_model}.h5"
+                        st.session_state.model = load_trained_model(model_path)
+                        st.session_state.label_encoders, st.session_state.scaler = load_preprocessing_objects()
+                        
+                        if st.session_state.model:
+                            st.success(f"✅ Model '{selected_model}' loaded successfully!")
+                        else:
+                            st.error("❌ Failed to load model")
+            else:
+                st.warning("⚠️ No trained models found in the models directory")
+        
+        else:  # URL
+            st.info("📌 Paste your model URL below")
+            st.markdown("**Supported:**")
+            st.markdown("- Google Drive shareable links")
+            st.markdown("- Direct download URLs (.h5 files)")
+            
+            model_url = st.text_input(
+                "Model URL:",
+                placeholder="https://example.com/model.h5 or Google Drive link",
+                help="Paste a direct download URL or Google Drive shareable link"
+            )
+            
+            if st.button("Download & Load Model"):
+                if model_url:
+                    # Download from URL
+                    model_path = download_model_from_url(model_url)
+                    
+                    if model_path:
+                        st.session_state.gdrive_model_path = model_path
+                        
+                        # Load model
+                        with st.spinner("Loading downloaded model..."):
+                            st.session_state.model = load_trained_model(model_path)
+                            st.session_state.label_encoders, st.session_state.scaler = load_preprocessing_objects()
+                            
+                            if st.session_state.model:
+                                st.success("✅ Model downloaded and loaded successfully!")
+                            else:
+                                st.error("❌ Failed to load model")
                     else:
-                        st.error("❌ Failed to load model")
-        else:
-            st.warning("⚠️ No trained models found in the models directory")
+                        st.error("❌ Failed to download model from URL")
+                else:
+                    st.warning("⚠️ Please enter a model URL")
         
         st.divider()
         
@@ -305,6 +471,7 @@ def main():
         show_gradcam = st.checkbox("Show Grad-CAM", value=True)
         show_lime = st.checkbox("Show LIME", value=True)
         lime_samples = st.slider("LIME Samples", 100, 2000, 1000, 100) if show_lime else 1000
+
     
     # Main content
     if st.session_state.model is None:
